@@ -33,9 +33,9 @@ Active follow-up variant:
 - [x] Run an 8-GPU trainer smoke with `--dynamic-conv-qkv`. First attempt `dynamic_qkv_smoke_20260608a` completed initial validation but failed at optimizer step because dynamic-conv `static_w` has first dimension `4`, not divisible by `world_size=8`; patched AdamW reduction to all-reduce non-shardable tensors. Retry `dynamic_qkv_smoke_20260608b` completed one training step on 8xH100: final train loss `18.944839`, val loss `10.824631`, peak memory `19188.69 MiB`, result saved to `runs/dynamic_qkv_smoke_20260608b/result.json`.
 - [x] Do not run the PR #93 baseline before the dynamic-conv test. No baseline run was launched.
 - [x] Prepare unique run IDs for full QKV dynamic-conv experiments before remote execution. Canceled partial run `dynamic_qkv_full_20260608a` before training because FA3 fell back to SDPA. Full run `dynamic_qkv_full_20260608b` completed 3040 steps on 8xH100 with FA3 active: final train loss `2.938606`, EMA val loss `3.363598`, checkpoint-averaged/best val loss `3.342036`, peak memory `68899.57 MiB`, total wall time `19.88m`.
-- [ ] Implement V-only target and identity initialization while preserving the previous QKV flag path.
-- [ ] Run a V-only identity-init 8-GPU smoke test.
-- [ ] If the smoke passes, run the full V-only identity-init training.
+- [x] Implement V-only target and identity initialization while preserving the previous QKV flag path. Added `--dynamic-conv-target {qkv,v}` and `--dynamic-conv-identity-init`; V-only leaves Q/K untouched before RoPE/QK norm.
+- [x] Run a V-only identity-init 8-GPU smoke test. `dynamic_vonly_identity_smoke_20260608a` completed one training step on 8xH100 with FA3 active.
+- [x] If the smoke passes, run the full V-only identity-init training. `dynamic_vonly_identity_full_20260608a` completed 3040 steps on 8xH100 with FA3 active: final train loss `3.188245`, EMA/best val loss `3.436971`, checkpoint-averaged val loss `3.438128`, peak memory `64994.82 MiB`, total training time `14.40m`, wall time `17.42m`.
 
 ## Implementation Plan
 
