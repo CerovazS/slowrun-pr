@@ -602,7 +602,7 @@ def _load_fa3():
             return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
-        return get_kernel('kernels-community/flash-attn3', version=1)
+        return get_kernel('kernels-community/flash-attn3', version=1, trust_remote_code=True)
     except ImportError:
         print0("Warning: kernels package not found. Install with: pip install -U kernels")
         return None
