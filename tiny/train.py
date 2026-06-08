@@ -487,6 +487,8 @@ parser.add_argument("--max-train-steps", type=int, default=3040,
                     help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
 parser.add_argument("--xsa-mode", choices=("off", "first6","all"), default="all",
                     help="Exclusive self-attention schedule.")
+parser.add_argument("--mlp-vector-gate", action="store_true",
+                    help="Enable a learned per-layer, per-channel gate on the MLP residual branch.")
 parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
 parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
@@ -651,6 +653,7 @@ class GPTConfig:
     device_batch_size: int = 32
     xsa_mode: str = "all"
     xsa_eps: float = 1e-4
+    mlp_vector_gate: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -738,9 +741,12 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None):
+    def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None, mlp_gate=None):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, xsa_alpha=xsa_alpha)
-        x = x + self.mlp(norm(x))
+        mlp_out = self.mlp(norm(x))
+        if mlp_gate is not None:
+            mlp_out = mlp_out * mlp_gate.type_as(mlp_out).view(1, 1, -1)
+        x = x + mlp_out
         return x
 
 
@@ -770,6 +776,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinearT(config.n_embd, padded_vocab)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        self.mlp_gates = nn.Parameter(torch.ones(config.n_layer, config.n_embd)) if config.mlp_vector_gate else None
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
@@ -798,6 +805,8 @@ class GPT(nn.Module):
 
         self.resid_lambdas.fill_(1.1)
         self.x0_lambdas.fill_(0.1)
+        if self.mlp_gates is not None:
+            self.mlp_gates.fill_(1.0)
         self.xsa_alphas.zero_()
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
@@ -856,6 +865,7 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel()
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
+                          + (self.mlp_gates.numel() if self.mlp_gates is not None else 0)
                           + self.skip_weights.numel()
                           + self.xsa_alphas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
@@ -885,6 +895,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
+        if self.mlp_gates is not None:
+            param_groups.append(dict(kind='adamw', params=[self.mlp_gates], lr=SCALAR_LR,
+                                     betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         if xsa_params:
             param_groups.append(dict(kind='adamw', params=xsa_params, lr=SCALAR_LR,
                                      betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
@@ -911,7 +924,8 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha)
+            mlp_gate = self.mlp_gates[i] if self.mlp_gates is not None else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha, mlp_gate=mlp_gate)
             if i < self.encoder_layers:
                 skip_connections.append(x)
         x = norm(x)
@@ -1327,6 +1341,7 @@ print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"  doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
+print0(f"  mlp_vector_gate={args.mlp_vector_gate}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -1347,7 +1362,7 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
-                   xsa_mode=args.xsa_mode)
+                   xsa_mode=args.xsa_mode, mlp_vector_gate=args.mlp_vector_gate)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
