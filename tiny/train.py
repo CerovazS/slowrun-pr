@@ -600,7 +600,6 @@ def _load_fa3():
         major, _ = torch.cuda.get_device_capability()
         if major != 9:
             return None
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
         return get_kernel('kernels-community/flash-attn3', version=1, trust_remote_code=True)
     except ImportError:
