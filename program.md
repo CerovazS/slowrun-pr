@@ -24,7 +24,7 @@ Initial variant:
 - [x] Run a small CUDA smoke test if a GPU is available locally; otherwise note that full kernel testing must happen on RunPod. Local CUDA is unavailable; RunPod kernel smoke passed on H100 with `[B=2, T=128, D=1024, H=32, W=4]`.
 - [x] Run an 8-GPU trainer smoke with `--dynamic-conv-qkv`. First attempt `dynamic_qkv_smoke_20260608a` completed initial validation but failed at optimizer step because dynamic-conv `static_w` has first dimension `4`, not divisible by `world_size=8`; patched AdamW reduction to all-reduce non-shardable tensors. Retry `dynamic_qkv_smoke_20260608b` completed one training step on 8xH100: final train loss `18.944839`, val loss `10.824631`, peak memory `19188.69 MiB`, result saved to `runs/dynamic_qkv_smoke_20260608b/result.json`.
 - [x] Do not run the PR #93 baseline before the dynamic-conv test. No baseline run was launched.
-- [ ] Prepare unique run IDs for full QKV dynamic-conv experiments before remote execution.
+- [x] Prepare unique run IDs for full QKV dynamic-conv experiments before remote execution. Canceled partial run `dynamic_qkv_full_20260608a` before training because FA3 fell back to SDPA. Full run `dynamic_qkv_full_20260608b` completed 3040 steps on 8xH100 with FA3 active: final train loss `2.938606`, EMA val loss `3.363598`, checkpoint-averaged/best val loss `3.342036`, peak memory `68899.57 MiB`, total wall time `19.88m`.
 
 ## Implementation Plan
 
@@ -52,7 +52,7 @@ Initial variant:
    - Local `py_compile`.
    - If CUDA is present, instantiate a tiny model and run forward/backward with `--dynamic-conv-qkv`.
    - On RunPod later, run one short precompile/minute-scale test before full tiny experiments.
-   - Caveat: the RunPod smoke used PyTorch SDPA fallback because the PR #93 FA3 loader needs `trust_remote_code=True` for `kernels-community/flash-attn3`; fix before timing-sensitive experiments.
+   - Caveat resolved for the full run: FA3 needs `trust_remote_code=True`, and the launcher must not export `HF_HUB_DISABLE_TELEMETRY=1` or `HF_HUB_DISABLE_PROGRESS_BARS=1` because `kernels==0.15.2` plus `huggingface_hub==1.18.0` emits an invalid user-agent header with those env vars set at process start.
 
 ## Backlog
 
