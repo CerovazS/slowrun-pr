@@ -21,11 +21,11 @@ Initial variant:
 - [x] Confirm whether an MLP gate already exists. Internal SwiGLU `c_gate` exists; external residual vector gate does not.
 - [x] Add the MLP vector gate behind a CLI flag with baseline default unchanged.
 - [x] Initialize the gate to identity (`1.0`) and exclude it from Muon/FLOP matmul counting.
-- [ ] Run local syntax checks.
-- [ ] Run an 8-GPU smoke test with `--mlp-vector-gate`.
-- [ ] If smoke passes, run full PR #93 default training plus `--mlp-vector-gate`.
+- [x] Run local syntax checks. `python3 -m py_compile tiny/train.py` and `git diff --check` passed.
+- [x] Run an 8-GPU smoke test with `--mlp-vector-gate`. `mlp_vector_gate_smoke_20260608c` completed with FA3 active.
+- [x] If smoke passes, run full PR #93 default training plus `--mlp-vector-gate`. `mlp_vector_gate_full_20260608a` completed; ckpt avg val loss `3.317193`, total train time `13.86m`.
 
 ## Backlog
 
-- If vector gate helps but is slow/unstable, try per-layer scalar MLP gate.
-- If identity vector gate is too weak, test a data-dependent MLP output gate from a small prefix of the residual stream.
+- Baseline-plus-vector-gate is effectively neutral/slightly worse than PR #93 baseline (`3.316223`), so do not prioritize this exact variant.
+- If still exploring gates, try a cheaper per-layer scalar MLP gate before data-dependent gating.
