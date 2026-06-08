@@ -2,15 +2,23 @@
 
 ## Active Request
 
-Build on PR #93 (`tiny-fp8-mtp-xsa`, commit `7b9a633`) and test the dynamic short convolution idea from arXiv:2606.03825 on the tiny-track model. The first implementation should add head-wise dynamic causal short convolutions on `q`, `k`, and `v` after projection and before RoPE/QK norm.
+Build on PR #93 (`tiny-fp8-mtp-xsa`, commit `7b9a633`) and test the dynamic short convolution idea from arXiv:2606.03825 on the tiny-track model.
 
-Initial variant:
+Completed initial variant:
 - head-wise dynamic convolution
 - kernel width `W=4`
 - head size `32` where compatible
 - fused residual enabled
 - applied to `q`, `k`, and `v`
 - controlled by CLI flags so the PR #93 baseline remains runnable from the same file
+
+Active follow-up variant:
+- V-only dynamic convolution
+- kernel width `W=4`
+- head size `32`
+- fused residual enabled
+- identity initialization: zero dynamic projection and zero static filter, so the branch starts as exact residual identity
+- Q/K are untouched, so RoPE, QK norm, key offset, and attention geometry remain on the PR #93 path
 
 ## Success Criteria
 
@@ -25,6 +33,9 @@ Initial variant:
 - [x] Run an 8-GPU trainer smoke with `--dynamic-conv-qkv`. First attempt `dynamic_qkv_smoke_20260608a` completed initial validation but failed at optimizer step because dynamic-conv `static_w` has first dimension `4`, not divisible by `world_size=8`; patched AdamW reduction to all-reduce non-shardable tensors. Retry `dynamic_qkv_smoke_20260608b` completed one training step on 8xH100: final train loss `18.944839`, val loss `10.824631`, peak memory `19188.69 MiB`, result saved to `runs/dynamic_qkv_smoke_20260608b/result.json`.
 - [x] Do not run the PR #93 baseline before the dynamic-conv test. No baseline run was launched.
 - [x] Prepare unique run IDs for full QKV dynamic-conv experiments before remote execution. Canceled partial run `dynamic_qkv_full_20260608a` before training because FA3 fell back to SDPA. Full run `dynamic_qkv_full_20260608b` completed 3040 steps on 8xH100 with FA3 active: final train loss `2.938606`, EMA val loss `3.363598`, checkpoint-averaged/best val loss `3.342036`, peak memory `68899.57 MiB`, total wall time `19.88m`.
+- [ ] Implement V-only target and identity initialization while preserving the previous QKV flag path.
+- [ ] Run a V-only identity-init 8-GPU smoke test.
+- [ ] If the smoke passes, run the full V-only identity-init training.
 
 ## Implementation Plan
 
@@ -56,7 +67,6 @@ Initial variant:
 
 ## Backlog
 
-- Test `v`-only dynamic conv if QKV is too slow.
 - Compare head-wise dynamic conv against static short conv QKV.
 - Test low-rank dynamic conv (`R=16`) only if head-wise is promising or too memory-heavy.
 - If tiny improves, port the smallest winning variant to the limited track.

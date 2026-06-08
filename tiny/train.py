@@ -489,11 +489,15 @@ parser.add_argument("--max-train-steps", type=int, default=3040,
 parser.add_argument("--xsa-mode", choices=("off", "first6","all"), default="all",
                     help="Exclusive self-attention schedule.")
 parser.add_argument("--dynamic-conv-qkv", action="store_true",
-                    help="Apply head-wise dynamic causal short convolutions to Q/K/V before RoPE/QK norm.")
+                    help="Enable head-wise dynamic causal short convolutions for the selected Q/K/V target.")
+parser.add_argument("--dynamic-conv-target", choices=("qkv", "v"), default="qkv",
+                    help="Attention projections to modify when dynamic convolution is enabled.")
 parser.add_argument("--dynamic-conv-width", type=int, default=4,
                     help="Dynamic short convolution kernel width.")
 parser.add_argument("--dynamic-conv-head-size", type=int, default=32,
                     help="Channels per shared dynamic-conv head.")
+parser.add_argument("--dynamic-conv-identity-init", action="store_true",
+                    help="Initialize dynamic convolution as exact residual identity: zero dynamic and static filters.")
 parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
 parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
@@ -658,8 +662,10 @@ class GPTConfig:
     xsa_mode: str = "all"
     xsa_eps: float = 1e-4
     dynamic_conv_qkv: bool = False
+    dynamic_conv_target: str = "qkv"
     dynamic_conv_width: int = 4
     dynamic_conv_head_size: int = 32
+    dynamic_conv_identity_init: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -675,7 +681,7 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class HeadwiseDynamicShortConvolution(nn.Module):
-    def __init__(self, input_dim, conv_dim, width, head_size):
+    def __init__(self, input_dim, conv_dim, width, head_size, identity_init=False):
         super().__init__()
         if width <= 0:
             raise ValueError(f"dynamic_conv_width must be positive, got {width}")
@@ -686,6 +692,7 @@ class HeadwiseDynamicShortConvolution(nn.Module):
         self.conv_dim = conv_dim
         self.width = width
         self.head_size = head_size
+        self.identity_init = identity_init
         self.num_dynamic_heads = conv_dim // head_size
         self.weight_proj = nn.Linear(input_dim, self.num_dynamic_heads * width, bias=False)
         self.static_w = nn.Parameter(torch.empty(width, conv_dim))
@@ -693,8 +700,11 @@ class HeadwiseDynamicShortConvolution(nn.Module):
     @torch.no_grad()
     def init_weights(self):
         torch.nn.init.zeros_(self.weight_proj.weight)
-        bound = 1.0 / math.sqrt(self.width)
-        torch.nn.init.uniform_(self.static_w, -bound, bound)
+        if self.identity_init:
+            torch.nn.init.zeros_(self.static_w)
+        else:
+            bound = 1.0 / math.sqrt(self.width)
+            torch.nn.init.uniform_(self.static_w, -bound, bound)
 
     def forward(self, x, conditioning):
         if not x.is_cuda:
@@ -727,17 +737,23 @@ class CausalSelfAttention(nn.Module):
         q_dim = self.n_head * self.head_dim
         kv_dim = self.n_kv_head * self.head_dim
         self.dynamic_conv_qkv = config.dynamic_conv_qkv
+        self.dynamic_conv_target = config.dynamic_conv_target
+        self.dynamic_conv_q = None
+        self.dynamic_conv_k = None
+        self.dynamic_conv_v = None
         if self.dynamic_conv_qkv:
-            self.dynamic_conv_q = HeadwiseDynamicShortConvolution(
-                self.n_embd, q_dim, config.dynamic_conv_width, config.dynamic_conv_head_size)
-            self.dynamic_conv_k = HeadwiseDynamicShortConvolution(
-                self.n_embd, kv_dim, config.dynamic_conv_width, config.dynamic_conv_head_size)
+            if self.dynamic_conv_target == "qkv":
+                self.dynamic_conv_q = HeadwiseDynamicShortConvolution(
+                    self.n_embd, q_dim, config.dynamic_conv_width, config.dynamic_conv_head_size,
+                    identity_init=config.dynamic_conv_identity_init)
+                self.dynamic_conv_k = HeadwiseDynamicShortConvolution(
+                    self.n_embd, kv_dim, config.dynamic_conv_width, config.dynamic_conv_head_size,
+                    identity_init=config.dynamic_conv_identity_init)
+            elif self.dynamic_conv_target != "v":
+                raise ValueError(f"unknown dynamic_conv_target: {self.dynamic_conv_target}")
             self.dynamic_conv_v = HeadwiseDynamicShortConvolution(
-                self.n_embd, kv_dim, config.dynamic_conv_width, config.dynamic_conv_head_size)
-        else:
-            self.dynamic_conv_q = None
-            self.dynamic_conv_k = None
-            self.dynamic_conv_v = None
+                self.n_embd, kv_dim, config.dynamic_conv_width, config.dynamic_conv_head_size,
+                identity_init=config.dynamic_conv_identity_init)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
@@ -761,9 +777,11 @@ class CausalSelfAttention(nn.Module):
             v = v.view(B, T, self.n_kv_head, self.head_dim)
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             v = (v + gate.unsqueeze(-1) * ve).view(B, T, -1)
-        if self.dynamic_conv_qkv:
+        if self.dynamic_conv_q is not None:
             q = self.dynamic_conv_q(q, x)
+        if self.dynamic_conv_k is not None:
             k = self.dynamic_conv_k(k, x)
+        if self.dynamic_conv_v is not None:
             v = self.dynamic_conv_v(v, x)
         q = q.view(B, T, self.n_head, self.head_dim)
         k = k.view(B, T, self.n_kv_head, self.head_dim)
@@ -862,9 +880,9 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             if block.attn.dynamic_conv_qkv:
-                block.attn.dynamic_conv_q.init_weights()
-                block.attn.dynamic_conv_k.init_weights()
-                block.attn.dynamic_conv_v.init_weights()
+                for conv in (block.attn.dynamic_conv_q, block.attn.dynamic_conv_k, block.attn.dynamic_conv_v):
+                    if conv is not None:
+                        conv.init_weights()
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -944,9 +962,9 @@ class GPT(nn.Module):
         dynamic_conv_params = []
         for block in self.transformer.h:
             if block.attn.dynamic_conv_qkv:
-                dynamic_conv_params.extend(block.attn.dynamic_conv_q.parameters())
-                dynamic_conv_params.extend(block.attn.dynamic_conv_k.parameters())
-                dynamic_conv_params.extend(block.attn.dynamic_conv_v.parameters())
+                for conv in (block.attn.dynamic_conv_q, block.attn.dynamic_conv_k, block.attn.dynamic_conv_v):
+                    if conv is not None:
+                        dynamic_conv_params.extend(conv.parameters())
         dynamic_conv_ids = {id(p) for p in dynamic_conv_params}
         all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids and id(p) not in dynamic_conv_ids]
@@ -1412,7 +1430,7 @@ print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"  doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
-print0(f"  dynamic_conv_qkv={args.dynamic_conv_qkv}, dynamic_conv_width={args.dynamic_conv_width}, dynamic_conv_head_size={args.dynamic_conv_head_size}")
+print0(f"  dynamic_conv_qkv={args.dynamic_conv_qkv}, dynamic_conv_target={args.dynamic_conv_target}, dynamic_conv_width={args.dynamic_conv_width}, dynamic_conv_head_size={args.dynamic_conv_head_size}, dynamic_conv_identity_init={args.dynamic_conv_identity_init}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -1434,8 +1452,10 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
                    xsa_mode=args.xsa_mode, dynamic_conv_qkv=args.dynamic_conv_qkv,
+                   dynamic_conv_target=args.dynamic_conv_target,
                    dynamic_conv_width=args.dynamic_conv_width,
-                   dynamic_conv_head_size=args.dynamic_conv_head_size)
+                   dynamic_conv_head_size=args.dynamic_conv_head_size,
+                   dynamic_conv_identity_init=args.dynamic_conv_identity_init)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
