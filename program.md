@@ -22,8 +22,7 @@ Initial variant:
 - [x] Add the MLP vector gate behind a CLI flag with baseline default unchanged.
 - [x] Initialize the gate to identity (`1.0`) and exclude it from Muon/FLOP matmul counting.
 - [x] Run local syntax checks. `python3 -m py_compile tiny/train.py` and `git diff --check` passed.
-- [x] Run an 8-GPU smoke test with `--mlp-vector-gate`. `mlp_vector_gate_smoke_20260608c` completed with FA3 active.
-- [x] If smoke passes, run full PR #93 default training plus `--mlp-vector-gate`. `mlp_vector_gate_full_20260608a` completed; ckpt avg val loss `3.317193`, total train time `13.86m`.
+- [x] Run full PR #93 default training plus `--mlp-vector-gate`. `mlp_vector_gate_full_20260608a` completed; ckpt avg val loss `3.317193`, total train time `13.86m`.
 
 ## Backlog
 
