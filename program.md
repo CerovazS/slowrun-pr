@@ -29,13 +29,10 @@ Active follow-up variant:
 - [x] Initialize the dynamic path to a static causal short convolution plus residual, matching the paper's head-wise initialization strategy. Dynamic projection is zero-init; static filter uses `U(-1/sqrt(W), 1/sqrt(W))`; residual is enabled.
 - [x] Keep dynamic-conv parameters in AdamW/scalar-style optimizer groups with zero weight decay. Dynamic params are excluded from Muon and appended to AdamW at `SCALAR_LR`.
 - [x] Run local syntax/import checks: `python -m py_compile tiny/train.py tiny/dynamic_conv1d_headwise.py`. `python3 -m py_compile ...` passed; local import/runtime is blocked by missing `tiktoken`/`triton`.
-- [x] Run a small CUDA smoke test if a GPU is available locally; otherwise note that full kernel testing must happen on RunPod. Local CUDA is unavailable; RunPod kernel smoke passed on H100 with `[B=2, T=128, D=1024, H=32, W=4]`.
-- [x] Run an 8-GPU trainer smoke with `--dynamic-conv-qkv`. First attempt `dynamic_qkv_smoke_20260608a` completed initial validation but failed at optimizer step because dynamic-conv `static_w` has first dimension `4`, not divisible by `world_size=8`; patched AdamW reduction to all-reduce non-shardable tensors. Retry `dynamic_qkv_smoke_20260608b` completed one training step on 8xH100: final train loss `18.944839`, val loss `10.824631`, peak memory `19188.69 MiB`, result saved to `runs/dynamic_qkv_smoke_20260608b/result.json`.
 - [x] Do not run the PR #93 baseline before the dynamic-conv test. No baseline run was launched.
 - [x] Prepare unique run IDs for full QKV dynamic-conv experiments before remote execution. Canceled partial run `dynamic_qkv_full_20260608a` before training because FA3 fell back to SDPA. Full run `dynamic_qkv_full_20260608b` completed 3040 steps on 8xH100 with FA3 active: final train loss `2.938606`, EMA val loss `3.363598`, checkpoint-averaged/best val loss `3.342036`, peak memory `68899.57 MiB`, total wall time `19.88m`.
 - [x] Implement V-only target and identity initialization while preserving the previous QKV flag path. Added `--dynamic-conv-target {qkv,v}` and `--dynamic-conv-identity-init`; V-only leaves Q/K untouched before RoPE/QK norm.
-- [x] Run a V-only identity-init 8-GPU smoke test. `dynamic_vonly_identity_smoke_20260608a` completed one training step on 8xH100 with FA3 active.
-- [x] If the smoke passes, run the full V-only identity-init training. `dynamic_vonly_identity_full_20260608a` completed 3040 steps on 8xH100 with FA3 active: final train loss `3.188245`, EMA/best val loss `3.436971`, checkpoint-averaged val loss `3.438128`, peak memory `64994.82 MiB`, total training time `14.40m`, wall time `17.42m`.
+- [x] Run the full V-only identity-init training. `dynamic_vonly_identity_full_20260608a` completed 3040 steps on 8xH100 with FA3 active: final train loss `3.188245`, EMA/best val loss `3.436971`, checkpoint-averaged val loss `3.438128`, peak memory `64994.82 MiB`, total training time `14.40m`, wall time `17.42m`.
 
 ## Implementation Plan
 
@@ -59,10 +56,8 @@ Active follow-up variant:
    - Keep existing Muon matrix group behavior unchanged for normal projection/MLP matrices.
    - Verify: all dynamic params are excluded from Muon and no trainable param is dropped.
 
-5. Smoke tests.
+5. Validation.
    - Local `py_compile`.
-   - If CUDA is present, instantiate a tiny model and run forward/backward with `--dynamic-conv-qkv`.
-   - On RunPod later, run one short precompile/minute-scale test before full tiny experiments.
    - Caveat resolved for the full run: FA3 needs `trust_remote_code=True`, and the launcher must not export `HF_HUB_DISABLE_TELEMETRY=1` or `HF_HUB_DISABLE_PROGRESS_BARS=1` because `kernels==0.15.2` plus `huggingface_hub==1.18.0` emits an invalid user-agent header with those env vars set at process start.
 
 ## Backlog
