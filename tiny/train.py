@@ -491,6 +491,22 @@ parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
 parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
                     help="Fraction of training over which the extra MTP heads decay to zero weight.")
+parser.add_argument("--loop-mode", choices=("none", "segment", "unet_decoder"), default="none",
+                    help="Repeat a tied layer segment during the forward pass.")
+parser.add_argument("--loop-start", type=int, default=0,
+                    help="Zero-indexed inclusive first layer of the repeated segment.")
+parser.add_argument("--loop-end", type=int, default=-1,
+                    help="Zero-indexed inclusive final layer of the repeated segment.")
+parser.add_argument("--loop-repeat-count", type=int, default=1,
+                    help="Maximum number of executions for the selected loop segment.")
+parser.add_argument("--loop-schedule", choices=("none", "late-transition"), default="none",
+                    help="Schedule for activating extra segment repeats.")
+parser.add_argument("--loop-transition-ratio", type=float, default=0.3,
+                    help="Final training fraction that uses --loop-repeat-count for late-transition.")
+parser.add_argument("--loop-bptt-mode", choices=("bptt1", "full"), default="bptt1",
+                    help="Gradient mode for repeated segment executions.")
+parser.add_argument("--disable-loop-x0-reinject", action="store_true",
+                    help="Disable x0 injection only inside active repeated loop segment passes.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -506,6 +522,17 @@ DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
+if args.loop_repeat_count < 1:
+    raise ValueError("--loop-repeat-count must be >= 1")
+if not 0.0 <= args.loop_transition_ratio <= 1.0:
+    raise ValueError("--loop-transition-ratio must be in [0, 1]")
+if args.loop_mode != "none":
+    if args.loop_end < args.loop_start:
+        raise ValueError("--loop-end must be >= --loop-start when --loop-mode is active")
+    if args.loop_start < 0 or args.loop_end >= DEPTH:
+        raise ValueError(f"--loop-start/--loop-end must be within [0, {DEPTH - 1}]")
+    if args.loop_mode == "unet_decoder" and args.loop_start < DEPTH // 2:
+        raise ValueError("--loop-mode unet_decoder requires --loop-start in the decoder half")
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -651,6 +678,11 @@ class GPTConfig:
     device_batch_size: int = 32
     xsa_mode: str = "all"
     xsa_eps: float = 1e-4
+    loop_mode: str = "none"
+    loop_start: int = 0
+    loop_end: int = -1
+    loop_bptt_mode: str = "bptt1"
+    disable_loop_x0_reinject: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -850,7 +882,7 @@ class GPT(nn.Module):
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self):
+    def estimate_flops(self, loop_repeat_count=1):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embedding lookup + elementwise scalars
         nparams_exclude = (self.transformer.wte.weight.numel()
@@ -861,7 +893,22 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
         attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        matmul_params = nparams - nparams_exclude
+        if self.config.loop_mode != "none" and loop_repeat_count > 1:
+            start, end = self.config.loop_start, self.config.loop_end
+            segment_params = 0
+            for i in range(start, end + 1):
+                segment_params += sum(p.numel() for p in self.transformer.h[i].parameters())
+                if str(i) in self.ve_projs:
+                    segment_params += sum(p.numel() for p in self.ve_projs[str(i)].parameters())
+            segment_attn_flops = sum(
+                12 * h * q * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
+                for i in range(start, end + 1)
+            )
+            extra_repeats = loop_repeat_count - 1
+            matmul_params += extra_repeats * segment_params
+            attn_flops += extra_repeats * segment_attn_flops
+        return 6 * matmul_params + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -898,22 +945,100 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean', mtp_weights=None):
+    def _run_layer(self, i, x, x0, cos_sin, skip_connections, disable_x0_reinject=False):
+        if i >= self.encoder_layers and skip_connections:
+            skip = skip_connections.pop()
+            x = x + self.skip_weights[i - self.encoder_layers] * skip
+        if disable_x0_reinject:
+            x = self.resid_lambdas[i] * x
+        else:
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+        xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
+        x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha)
+        if i < self.encoder_layers:
+            skip_connections.append(x)
+        return x
+
+    def _run_layer_range(self, start, end, x, x0, cos_sin, skip_connections, disable_x0_reinject=False):
+        for i in range(start, end + 1):
+            x = self._run_layer(
+                i,
+                x,
+                x0,
+                cos_sin,
+                skip_connections,
+                disable_x0_reinject=disable_x0_reinject,
+            )
+        return x, skip_connections
+
+    def _run_loop_segment(self, x, x0, cos_sin, skip_connections, loop_repeat_count):
+        entry_skip_connections = list(skip_connections)
+        final_skip_connections = skip_connections
+        disable_x0 = self.config.disable_loop_x0_reinject and loop_repeat_count > 1
+        for repeat_idx in range(loop_repeat_count):
+            local_skip_connections = list(entry_skip_connections)
+            is_final_repeat = repeat_idx == loop_repeat_count - 1
+            if (
+                self.training
+                and self.config.loop_bptt_mode == "bptt1"
+                and not is_final_repeat
+            ):
+                with torch.no_grad():
+                    x, _ = self._run_layer_range(
+                        self.config.loop_start,
+                        self.config.loop_end,
+                        x,
+                        x0,
+                        cos_sin,
+                        local_skip_connections,
+                        disable_x0_reinject=disable_x0,
+                    )
+                x = x.detach()
+            else:
+                x, final_skip_connections = self._run_layer_range(
+                    self.config.loop_start,
+                    self.config.loop_end,
+                    x,
+                    x0,
+                    cos_sin,
+                    local_skip_connections,
+                    disable_x0_reinject=disable_x0,
+                )
+        return x, final_skip_connections
+
+    def forward(
+        self,
+        idx,
+        targets=None,
+        loss_reduction='mean',
+        mtp_weights=None,
+        loop_repeat_count=1,
+    ):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
         skip_connections = []
-        for i, block in enumerate(self.transformer.h):
-            if i >= self.encoder_layers and skip_connections:
-                skip = skip_connections.pop()
-                x = x + self.skip_weights[i - self.encoder_layers] * skip
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha)
-            if i < self.encoder_layers:
-                skip_connections.append(x)
+        i = 0
+        while i < self.config.n_layer:
+            should_loop = (
+                self.config.loop_mode != "none"
+                and loop_repeat_count > 1
+                and i == self.config.loop_start
+            )
+            if should_loop:
+                x, skip_connections = self._run_loop_segment(
+                    x,
+                    x0,
+                    cos_sin,
+                    skip_connections,
+                    loop_repeat_count,
+                )
+                i = self.config.loop_end + 1
+            else:
+                x = self._run_layer(i, x, x0, cos_sin, skip_connections)
+                i += 1
         x = norm(x)
         if targets is not None:
             # MTP training path: single lm_head, shifted targets, fused fp8 softcapped CE.
@@ -1216,7 +1341,7 @@ class DataLoader:
 # =============================================================================
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb(model, batches, steps, token_bytes, loop_repeat_count=1):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
@@ -1225,7 +1350,12 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none').view(-1)
+        loss2d = model(
+            x,
+            y,
+            loss_reduction='none',
+            loop_repeat_count=loop_repeat_count,
+        ).view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -1327,6 +1457,12 @@ print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"  doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
+print0(
+    f"  loop_mode={args.loop_mode}, loop_range={args.loop_start}-{args.loop_end}, "
+    f"loop_repeat_count={args.loop_repeat_count}, loop_schedule={args.loop_schedule}, "
+    f"loop_transition_ratio={args.loop_transition_ratio}, loop_bptt_mode={args.loop_bptt_mode}, "
+    f"disable_loop_x0_reinject={args.disable_loop_x0_reinject}"
+)
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -1347,7 +1483,12 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
-                   xsa_mode=args.xsa_mode)
+                   xsa_mode=args.xsa_mode,
+                   loop_mode=args.loop_mode,
+                   loop_start=args.loop_start,
+                   loop_end=args.loop_end,
+                   loop_bptt_mode=args.loop_bptt_mode,
+                   disable_loop_x0_reinject=args.disable_loop_x0_reinject)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1390,6 +1531,15 @@ print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps}
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 if args.max_train_steps > 0:
     print0(f"Stopping after max_train_steps={args.max_train_steps:,}")
+if args.loop_mode != "none":
+    max_loop_flops_per_token = orig_model.estimate_flops(args.loop_repeat_count)
+    print0(f"Max loop FLOPs per token: {max_loop_flops_per_token:e}")
+    if args.loop_schedule == "late-transition" and args.loop_repeat_count > 1:
+        loop_start_step = round((1.0 - args.loop_transition_ratio) * target_iterations)
+        print0(
+            f"Loop schedule: steps 0-{loop_start_step} use 1x, "
+            f"steps {loop_start_step}-{target_iterations} use {args.loop_repeat_count}x"
+        )
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
@@ -1404,6 +1554,16 @@ def get_lr_multiplier(it):
 
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
+
+def get_loop_repeat_count(it):
+    if args.loop_mode == "none":
+        return 1
+    if args.loop_repeat_count <= 1:
+        return 1
+    if args.loop_schedule == "none":
+        return args.loop_repeat_count
+    transition_start = (1.0 - args.loop_transition_ratio) * target_iterations
+    return args.loop_repeat_count if it >= transition_start else 1
 
 def get_mtp_weights(it):
     """Per-offset MTP loss weights at optimizer step `it`.
@@ -1447,18 +1607,30 @@ _swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if a
 late_ckpt_paths = []
 
 # Initial val evaluation
+active_loop_repeat_count = get_loop_repeat_count(step)
 model.eval()
 val_loader = build_val_loader()
 with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+    val_bpb, val_loss = evaluate_bpb(
+        model,
+        val_loader,
+        eval_steps,
+        token_bytes,
+        loop_repeat_count=active_loop_repeat_count,
+    )
+print0(
+    f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} "
+    f"| loop repeats: {active_loop_repeat_count}"
+)
+wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss,
+               "val/loop_repeat_count": active_loop_repeat_count})
 min_val_bpb = val_bpb
 min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
     # Training step
+    active_loop_repeat_count = get_loop_repeat_count(step)
     synchronize()
     t0 = time.time()
     mtp_w = get_mtp_weights(step)  # same weights across the grad-accum micro-steps
@@ -1468,7 +1640,12 @@ while current_epoch <= args.num_epochs:
             # before. During the MTP phase this loss is the weighted multi-offset sum,
             # so the logged value runs higher than the naive run until the extra
             # offsets anneal to zero.
-            loss = model(x, y, mtp_weights=mtp_w).mean()
+            loss = model(
+                x,
+                y,
+                mtp_weights=mtp_w,
+                loop_repeat_count=active_loop_repeat_count,
+            ).mean()
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -1513,13 +1690,19 @@ while current_epoch <= args.num_epochs:
     debiased = smooth_train_loss / (1 - ema_beta**step)
     pct = 100 * step / target_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
+    active_flops_per_token = orig_model.estimate_flops(active_loop_repeat_count)
+    mfu = 100 * active_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
     if step > 3:
         total_training_time += dt
     steps_done = step - 3
     eta_str = f" | eta: {(target_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    print0(
+        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | "
+        f"dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | "
+        f"bf16_mfu: {mfu:.2f}% | loop repeats: {active_loop_repeat_count}{eta_str}"
+    )
+    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
+                   "train/loop_repeat_count": active_loop_repeat_count})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1531,10 +1714,22 @@ while current_epoch <= args.num_epochs:
     if epoch != current_epoch:
         model.eval()
         val_loader = build_val_loader()
+        eval_loop_repeat_count = get_loop_repeat_count(step)
         with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+            val_bpb, val_loss = evaluate_bpb(
+                model,
+                val_loader,
+                eval_steps,
+                token_bytes,
+                loop_repeat_count=eval_loop_repeat_count,
+            )
+        print0(
+            f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | "
+            f"Val Loss: {val_loss:.6f} | loop repeats: {eval_loop_repeat_count}"
+        )
+        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb,
+                       "val/loss": val_loss,
+                       "val/loop_repeat_count": eval_loop_repeat_count})
         # Save checkpoint for weight averaging
         ckpt_path = os.path.join(checkpoints_dir, f"epoch_{current_epoch:03d}.pt")
         if master_process:
@@ -1566,6 +1761,7 @@ while current_epoch <= args.num_epochs:
         gc.collect(); gc.freeze(); gc.disable()
 
 # Final EMA evaluation
+final_loop_repeat_count = get_loop_repeat_count(step)
 if ema_params is not None:
     ema_updates = step // args.update_ema_every
     if ema_updates > 0:
@@ -1576,9 +1772,20 @@ if ema_params is not None:
                 p.copy_(ema * correction)
         val_loader = build_val_loader()
         with autocast_ctx:
-            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
-        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
+            ema_bpb, ema_loss = evaluate_bpb(
+                model,
+                val_loader,
+                eval_steps,
+                token_bytes,
+                loop_repeat_count=final_loop_repeat_count,
+            )
+        print0(
+            f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f} "
+            f"| loop repeats: {final_loop_repeat_count}"
+        )
+        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb,
+                       "val/ema_loss": ema_loss,
+                       "val/loop_repeat_count": final_loop_repeat_count})
         val_bpb = ema_bpb
         val_loss = ema_loss
         if ema_bpb < min_val_bpb:
@@ -1603,16 +1810,27 @@ if len(late_ckpt_paths) >= 2:
     model.eval()
     val_loader = build_val_loader()
     with autocast_ctx:
-        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
-    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
+        avg_bpb, avg_loss = evaluate_bpb(
+            model,
+            val_loader,
+            eval_steps,
+            token_bytes,
+            loop_repeat_count=final_loop_repeat_count,
+        )
+    print0(
+        f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f} "
+        f"| loop repeats: {final_loop_repeat_count}"
+    )
+    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss,
+                   "ckpt_avg/loop_repeat_count": final_loop_repeat_count})
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
 
 # Summary
 wall_clock_time = time.time() - wall_clock_start
+peak_memory_mib = get_max_memory() / 1024 / 1024
 print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
-print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
+print0(f"Peak memory: {peak_memory_mib:.2f} MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
 print0(f"Final train loss: {final_train_loss:.6f}")
@@ -1628,10 +1846,22 @@ if master_process:
         "num_epochs": args.num_epochs,
         "max_train_steps": args.max_train_steps,
         "xsa_mode": args.xsa_mode,
+        "loop_mode": args.loop_mode,
+        "loop_start": args.loop_start,
+        "loop_end": args.loop_end,
+        "loop_repeat_count": args.loop_repeat_count,
+        "loop_schedule": args.loop_schedule,
+        "loop_transition_ratio": args.loop_transition_ratio,
+        "loop_bptt_mode": args.loop_bptt_mode,
+        "disable_loop_x0_reinject": args.disable_loop_x0_reinject,
+        "final_loop_repeat_count": final_loop_repeat_count,
         "effective_train_tokens": step * TOTAL_BATCH_SIZE,
         "steps": step,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
+        "total_training_time_sec": total_training_time,
+        "wall_clock_time_sec": wall_clock_time,
+        "peak_memory_mib": peak_memory_mib,
         "wandb_url": getattr(wandb_run, "url", None),
     }
     with open(result_path, "w") as f:
