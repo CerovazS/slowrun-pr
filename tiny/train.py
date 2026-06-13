@@ -507,6 +507,12 @@ parser.add_argument("--loop-bptt-mode", choices=("bptt1", "full"), default="bptt
                     help="Gradient mode for repeated segment executions.")
 parser.add_argument("--disable-loop-x0-reinject", action="store_true",
                     help="Disable x0 injection only inside active repeated loop segment passes.")
+parser.add_argument("--x0-conditioning",
+                    choices=("none", "global_mlp_per_layer_scalar", "loop_mlp_per_layer_scalar", "loop_mlp_adaln_external"),
+                    default="none",
+                    help="Additional x0 conditioning path for active U-Net decoder loop layers.")
+parser.add_argument("--x0-conditioning-granularity", choices=("d_model", "head"), default="d_model",
+                    help="Granularity for external scale/bias/gate x0 conditioning.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -533,6 +539,8 @@ if args.loop_mode != "none":
         raise ValueError(f"--loop-start/--loop-end must be within [0, {DEPTH - 1}]")
     if args.loop_mode == "unet_decoder" and args.loop_start < DEPTH // 2:
         raise ValueError("--loop-mode unet_decoder requires --loop-start in the decoder half")
+if args.x0_conditioning != "none" and args.loop_mode != "unet_decoder":
+    raise ValueError("--x0-conditioning modes are currently restricted to --loop-mode unet_decoder")
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -683,6 +691,8 @@ class GPTConfig:
     loop_end: int = -1
     loop_bptt_mode: str = "bptt1"
     disable_loop_x0_reinject: bool = False
+    x0_conditioning: str = "none"
+    x0_conditioning_granularity: str = "d_model"
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -764,6 +774,16 @@ class MLP(nn.Module):
         return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x))
 
 
+class X0MLP(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.c_fc = nn.Linear(in_features, in_features, bias=False)
+        self.c_proj = nn.Linear(in_features, out_features, bias=False)
+
+    def forward(self, x):
+        return self.c_proj(F.silu(self.c_fc(x)))
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -809,6 +829,26 @@ class GPT(nn.Module):
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.xsa_alphas = nn.Parameter(torch.zeros(config.n_layer, config.n_head))
+        self.x0_conditioning = config.x0_conditioning
+        self.x0_loop_scalars = None
+        self.x0_global_mlp = None
+        self.x0_loop_mlps = nn.ModuleDict()
+        self.x0_sbg_mlps = nn.ModuleDict()
+        if config.x0_conditioning == "global_mlp_per_layer_scalar":
+            self.x0_loop_scalars = nn.Parameter(torch.zeros(config.n_layer))
+            self.x0_global_mlp = X0MLP(config.n_embd, config.n_embd)
+        elif config.x0_conditioning == "loop_mlp_per_layer_scalar":
+            self.x0_loop_scalars = nn.Parameter(torch.zeros(config.n_layer))
+            self.x0_loop_mlps = nn.ModuleDict({
+                str(i): X0MLP(config.n_embd, config.n_embd)
+                for i in range(config.loop_start, config.loop_end + 1)
+            })
+        elif config.x0_conditioning == "loop_mlp_adaln_external":
+            sbg_dim = config.n_head if config.x0_conditioning_granularity == "head" else config.n_embd
+            self.x0_sbg_mlps = nn.ModuleDict({
+                str(i): X0MLP(config.n_embd, 3 * sbg_dim)
+                for i in range(config.loop_start, config.loop_end + 1)
+            })
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -831,6 +871,16 @@ class GPT(nn.Module):
         self.resid_lambdas.fill_(1.1)
         self.x0_lambdas.fill_(0.1)
         self.xsa_alphas.zero_()
+        if self.x0_loop_scalars is not None:
+            self.x0_loop_scalars.fill_(0.1)
+        x0_mlp_modules = []
+        if self.x0_global_mlp is not None:
+            x0_mlp_modules.append(self.x0_global_mlp)
+        x0_mlp_modules.extend(self.x0_loop_mlps.values())
+        x0_mlp_modules.extend(self.x0_sbg_mlps.values())
+        for mlp in x0_mlp_modules:
+            torch.nn.init.uniform_(mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(mlp.c_proj.weight)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
@@ -915,7 +965,12 @@ class GPT(nn.Module):
         # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
         attn_gate_ids = {id(p) for p in attn_gate_params}
-        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        x0_conditioning_matrix_params = []
+        if self.x0_global_mlp is not None:
+            x0_conditioning_matrix_params.extend(self.x0_global_mlp.parameters())
+        x0_conditioning_matrix_params.extend(self.x0_loop_mlps.parameters())
+        x0_conditioning_matrix_params.extend(self.x0_sbg_mlps.parameters())
+        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters()) + list(x0_conditioning_matrix_params)
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -923,6 +978,7 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
         xsa_params = [self.xsa_alphas] if self.config.xsa_mode != "off" else []
+        x0_conditioning_scalar_params = [self.x0_loop_scalars] if self.x0_loop_scalars is not None else []
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
@@ -932,6 +988,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
+        if x0_conditioning_scalar_params:
+            param_groups.append(dict(kind='adamw', params=x0_conditioning_scalar_params, lr=SCALAR_LR,
+                                     betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         if xsa_params:
             param_groups.append(dict(kind='adamw', params=xsa_params, lr=SCALAR_LR,
                                      betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
@@ -945,7 +1004,45 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_layer(self, i, x, x0, cos_sin, skip_connections, disable_x0_reinject=False):
+    def _apply_loop_x0_conditioning(self, i, x, x0, x0_global_cache=None):
+        if self.config.x0_conditioning == "none":
+            return x
+        key = str(i)
+        if self.config.x0_conditioning == "global_mlp_per_layer_scalar":
+            x0_mlp = x0_global_cache if x0_global_cache is not None else self.x0_global_mlp(x0)
+            return x + self.x0_loop_scalars[i].type_as(x) * x0_mlp
+        if self.config.x0_conditioning == "loop_mlp_per_layer_scalar":
+            if key not in self.x0_loop_mlps:
+                return x
+            return x + self.x0_loop_scalars[i].type_as(x) * self.x0_loop_mlps[key](x0)
+        if self.config.x0_conditioning == "loop_mlp_adaln_external":
+            if key not in self.x0_sbg_mlps:
+                return x
+            pooled_x0 = x0.mean(dim=1)
+            scale, bias, gate = self.x0_sbg_mlps[key](pooled_x0).type_as(x).chunk(3, dim=-1)
+            gate = torch.sigmoid(gate)
+            if self.config.x0_conditioning_granularity == "head":
+                head_dim = self.config.n_embd // self.config.n_head
+                scale = scale.repeat_interleave(head_dim, dim=-1)
+                bias = bias.repeat_interleave(head_dim, dim=-1)
+                gate = gate.repeat_interleave(head_dim, dim=-1)
+            scale = scale.unsqueeze(1)
+            bias = bias.unsqueeze(1)
+            gate = gate.unsqueeze(1)
+            return x * (1 + gate * scale) + gate * bias
+        raise ValueError(f"unknown x0_conditioning: {self.config.x0_conditioning}")
+
+    def _run_layer(
+        self,
+        i,
+        x,
+        x0,
+        cos_sin,
+        skip_connections,
+        disable_x0_reinject=False,
+        apply_x0_conditioning=False,
+        x0_global_cache=None,
+    ):
         if i >= self.encoder_layers and skip_connections:
             skip = skip_connections.pop()
             x = x + self.skip_weights[i - self.encoder_layers] * skip
@@ -953,6 +1050,8 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x
         else:
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        if apply_x0_conditioning:
+            x = self._apply_loop_x0_conditioning(i, x, x0, x0_global_cache=x0_global_cache)
         ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
         xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
         x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha)
@@ -960,7 +1059,18 @@ class GPT(nn.Module):
             skip_connections.append(x)
         return x
 
-    def _run_layer_range(self, start, end, x, x0, cos_sin, skip_connections, disable_x0_reinject=False):
+    def _run_layer_range(
+        self,
+        start,
+        end,
+        x,
+        x0,
+        cos_sin,
+        skip_connections,
+        disable_x0_reinject=False,
+        apply_x0_conditioning=False,
+        x0_global_cache=None,
+    ):
         for i in range(start, end + 1):
             x = self._run_layer(
                 i,
@@ -969,6 +1079,8 @@ class GPT(nn.Module):
                 cos_sin,
                 skip_connections,
                 disable_x0_reinject=disable_x0_reinject,
+                apply_x0_conditioning=apply_x0_conditioning,
+                x0_global_cache=x0_global_cache,
             )
         return x, skip_connections
 
@@ -985,6 +1097,11 @@ class GPT(nn.Module):
                 and not is_final_repeat
             ):
                 with torch.no_grad():
+                    x0_global_cache = (
+                        self.x0_global_mlp(x0)
+                        if self.config.x0_conditioning == "global_mlp_per_layer_scalar"
+                        else None
+                    )
                     x, _ = self._run_layer_range(
                         self.config.loop_start,
                         self.config.loop_end,
@@ -993,9 +1110,16 @@ class GPT(nn.Module):
                         cos_sin,
                         local_skip_connections,
                         disable_x0_reinject=disable_x0,
+                        apply_x0_conditioning=True,
+                        x0_global_cache=x0_global_cache,
                     )
                 x = x.detach()
             else:
+                x0_global_cache = (
+                    self.x0_global_mlp(x0)
+                    if self.config.x0_conditioning == "global_mlp_per_layer_scalar"
+                    else None
+                )
                 x, final_skip_connections = self._run_layer_range(
                     self.config.loop_start,
                     self.config.loop_end,
@@ -1004,6 +1128,8 @@ class GPT(nn.Module):
                     cos_sin,
                     local_skip_connections,
                     disable_x0_reinject=disable_x0,
+                    apply_x0_conditioning=True,
+                    x0_global_cache=x0_global_cache,
                 )
         return x, final_skip_connections
 
@@ -1463,6 +1589,10 @@ print0(
     f"loop_transition_ratio={args.loop_transition_ratio}, loop_bptt_mode={args.loop_bptt_mode}, "
     f"disable_loop_x0_reinject={args.disable_loop_x0_reinject}"
 )
+print0(
+    f"  x0_conditioning={args.x0_conditioning}, "
+    f"x0_conditioning_granularity={args.x0_conditioning_granularity}"
+)
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -1488,7 +1618,9 @@ config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_siz
                    loop_start=args.loop_start,
                    loop_end=args.loop_end,
                    loop_bptt_mode=args.loop_bptt_mode,
-                   disable_loop_x0_reinject=args.disable_loop_x0_reinject)
+                   disable_loop_x0_reinject=args.disable_loop_x0_reinject,
+                   x0_conditioning=args.x0_conditioning,
+                   x0_conditioning_granularity=args.x0_conditioning_granularity)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1854,6 +1986,8 @@ if master_process:
         "loop_transition_ratio": args.loop_transition_ratio,
         "loop_bptt_mode": args.loop_bptt_mode,
         "disable_loop_x0_reinject": args.disable_loop_x0_reinject,
+        "x0_conditioning": args.x0_conditioning,
+        "x0_conditioning_granularity": args.x0_conditioning_granularity,
         "final_loop_repeat_count": final_loop_repeat_count,
         "effective_train_tokens": step * TOTAL_BATCH_SIZE,
         "steps": step,
