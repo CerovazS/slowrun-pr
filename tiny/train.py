@@ -508,7 +508,13 @@ parser.add_argument("--loop-bptt-mode", choices=("bptt1", "full"), default="bptt
 parser.add_argument("--disable-loop-x0-reinject", action="store_true",
                     help="Disable x0 injection only inside active repeated loop segment passes.")
 parser.add_argument("--x0-conditioning",
-                    choices=("none", "global_mlp_per_layer_scalar", "loop_mlp_per_layer_scalar", "loop_mlp_adaln_external"),
+                    choices=(
+                        "none",
+                        "global_mlp_per_layer_scalar",
+                        "loop_mlp_per_layer_scalar",
+                        "loop_mlp_adaln_external",
+                        "loop_mlp_adaln_norm_external",
+                    ),
                     default="none",
                     help="Additional x0 conditioning path for active U-Net decoder loop layers.")
 parser.add_argument("--x0-conditioning-granularity", choices=("d_model", "head"), default="d_model",
@@ -790,9 +796,16 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, xsa_alpha=xsa_alpha)
-        x = x + self.mlp(norm(x))
+    def _apply_adaln(self, x, x0_adaln):
+        x = norm(x)
+        if x0_adaln is None:
+            return x
+        scale, bias, gate = x0_adaln
+        return x * (1 + gate * scale) + gate * bias
+
+    def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None, x0_adaln=None):
+        x = x + self.attn(self._apply_adaln(x, x0_adaln), ve, cos_sin, window_size, xsa_alpha=xsa_alpha)
+        x = x + self.mlp(self._apply_adaln(x, x0_adaln))
         return x
 
 
@@ -843,7 +856,7 @@ class GPT(nn.Module):
                 str(i): X0MLP(config.n_embd, config.n_embd)
                 for i in range(config.loop_start, config.loop_end + 1)
             })
-        elif config.x0_conditioning == "loop_mlp_adaln_external":
+        elif config.x0_conditioning in ("loop_mlp_adaln_external", "loop_mlp_adaln_norm_external"):
             sbg_dim = config.n_head if config.x0_conditioning_granularity == "head" else config.n_embd
             self.x0_sbg_mlps = nn.ModuleDict({
                 str(i): X0MLP(config.n_embd, 3 * sbg_dim)
@@ -1019,21 +1032,28 @@ class GPT(nn.Module):
                 return x
             return x + self.x0_loop_scalars[i].type_as(x) * self.x0_loop_mlps[key](x0)
         if self.config.x0_conditioning == "loop_mlp_adaln_external":
-            if key not in self.x0_sbg_mlps:
+            x0_adaln = self._get_loop_x0_adaln(i, x, x0)
+            if x0_adaln is None:
                 return x
-            pooled_x0 = x0.mean(dim=1)
-            scale, bias, gate = self.x0_sbg_mlps[key](pooled_x0).type_as(x).chunk(3, dim=-1)
-            gate = torch.sigmoid(gate)
-            if self.config.x0_conditioning_granularity == "head":
-                head_dim = self.config.n_embd // self.config.n_head
-                scale = scale.repeat_interleave(head_dim, dim=-1)
-                bias = bias.repeat_interleave(head_dim, dim=-1)
-                gate = gate.repeat_interleave(head_dim, dim=-1)
-            scale = scale.unsqueeze(1)
-            bias = bias.unsqueeze(1)
-            gate = gate.unsqueeze(1)
+            scale, bias, gate = x0_adaln
             return x * (1 + gate * scale) + gate * bias
+        if self.config.x0_conditioning == "loop_mlp_adaln_norm_external":
+            return x
         raise ValueError(f"unknown x0_conditioning: {self.config.x0_conditioning}")
+
+    def _get_loop_x0_adaln(self, i, x, x0):
+        key = str(i)
+        if key not in self.x0_sbg_mlps:
+            return None
+        pooled_x0 = x0.mean(dim=1)
+        scale, bias, gate = self.x0_sbg_mlps[key](pooled_x0).type_as(x).chunk(3, dim=-1)
+        gate = torch.sigmoid(gate)
+        if self.config.x0_conditioning_granularity == "head":
+            head_dim = self.config.n_embd // self.config.n_head
+            scale = scale.repeat_interleave(head_dim, dim=-1)
+            bias = bias.repeat_interleave(head_dim, dim=-1)
+            gate = gate.repeat_interleave(head_dim, dim=-1)
+        return scale.unsqueeze(1), bias.unsqueeze(1), gate.unsqueeze(1)
 
     def _run_layer(
         self,
@@ -1057,7 +1077,12 @@ class GPT(nn.Module):
             x = self._apply_loop_x0_conditioning(i, x, x0, x0_global_cache=x0_global_cache)
         ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
         xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
-        x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha)
+        x0_adaln = (
+            self._get_loop_x0_adaln(i, x, x0)
+            if apply_x0_conditioning and self.config.x0_conditioning == "loop_mlp_adaln_norm_external"
+            else None
+        )
+        x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha, x0_adaln=x0_adaln)
         if i < self.encoder_layers:
             skip_connections.append(x)
         return x
