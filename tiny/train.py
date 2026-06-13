@@ -970,7 +970,7 @@ class GPT(nn.Module):
             x0_conditioning_matrix_params.extend(self.x0_global_mlp.parameters())
         x0_conditioning_matrix_params.extend(self.x0_loop_mlps.parameters())
         x0_conditioning_matrix_params.extend(self.x0_sbg_mlps.parameters())
-        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters()) + list(x0_conditioning_matrix_params)
+        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -991,6 +991,9 @@ class GPT(nn.Module):
         if x0_conditioning_scalar_params:
             param_groups.append(dict(kind='adamw', params=x0_conditioning_scalar_params, lr=SCALAR_LR,
                                      betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
+        if x0_conditioning_matrix_params:
+            param_groups.append(dict(kind='adamw', params=x0_conditioning_matrix_params, lr=MATRIX_LR,
+                                     betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY))
         if xsa_params:
             param_groups.append(dict(kind='adamw', params=xsa_params, lr=SCALAR_LR,
                                      betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
