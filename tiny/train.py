@@ -1281,6 +1281,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         infos = {}
         for p in group['params']:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad, is_small=True)
@@ -1290,10 +1292,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 grad_slice = torch.empty_like(grad[:rank_size])
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
-        return dict(param_infos=infos)
+        return dict(param_infos=infos, params=list(infos))
 
     def _reduce_muon(self, group, world_size):
-        params = group['params']
+        params = [p for p in group['params'] if p.grad is not None]
+        if not params:
+            return dict(skip=True)
         chunk_size = (len(params) + world_size - 1) // world_size
         padded = chunk_size * world_size
         p = params[0]
@@ -1304,10 +1308,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
             stacked_grads[len(params):].zero_()
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size, params=params)
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
-        for p in group['params']:
+        for p in info['params']:
             pinfo = info['param_infos'][p]
             pinfo['future'].wait()
             state = self.state[p]
@@ -1336,8 +1340,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group, info, gather_list, rank):
+        if info.get('skip'):
+            return
         info['future'].wait()
-        params = group['params']
+        params = info['params']
         chunk_size = info['chunk_size']
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
