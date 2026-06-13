@@ -519,6 +519,10 @@ parser.add_argument("--x0-conditioning",
                     help="Additional x0 conditioning path for active U-Net decoder loop layers.")
 parser.add_argument("--x0-conditioning-granularity", choices=("d_model", "head"), default="d_model",
                     help="Granularity for external scale/bias/gate x0 conditioning.")
+parser.add_argument("--residual-layout",
+                    choices=("sequential", "parallel", "parallel_nonloop_sequential_loop"),
+                    default="sequential",
+                    help="Residual layout inside transformer blocks.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -547,6 +551,8 @@ if args.loop_mode != "none":
         raise ValueError("--loop-mode unet_decoder requires --loop-start in the decoder half")
 if args.x0_conditioning != "none" and args.loop_mode != "unet_decoder":
     raise ValueError("--x0-conditioning modes are currently restricted to --loop-mode unet_decoder")
+if args.residual_layout == "parallel_nonloop_sequential_loop" and args.loop_mode == "none":
+    raise ValueError("--residual-layout parallel_nonloop_sequential_loop requires an active --loop-mode")
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -699,6 +705,7 @@ class GPTConfig:
     disable_loop_x0_reinject: bool = False
     x0_conditioning: str = "none"
     x0_conditioning_granularity: str = "d_model"
+    residual_layout: str = "sequential"
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -795,6 +802,13 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.parallel_residual = (
+            config.residual_layout == "parallel"
+            or (
+                config.residual_layout == "parallel_nonloop_sequential_loop"
+                and not (config.loop_start <= layer_idx <= config.loop_end)
+            )
+        )
 
     def _apply_adaln(self, x, x0_adaln):
         x = norm(x)
@@ -804,6 +818,9 @@ class Block(nn.Module):
         return x * (1 + gate * scale) + gate * bias
 
     def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None, x0_adaln=None):
+        if self.parallel_residual:
+            h = self._apply_adaln(x, x0_adaln)
+            return x + self.attn(h, ve, cos_sin, window_size, xsa_alpha=xsa_alpha) + self.mlp(h)
         x = x + self.attn(self._apply_adaln(x, x0_adaln), ve, cos_sin, window_size, xsa_alpha=xsa_alpha)
         x = x + self.mlp(self._apply_adaln(x, x0_adaln))
         return x
@@ -1627,6 +1644,7 @@ print0(
     f"  x0_conditioning={args.x0_conditioning}, "
     f"x0_conditioning_granularity={args.x0_conditioning_granularity}"
 )
+print0(f"  residual_layout={args.residual_layout}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -1654,7 +1672,8 @@ config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_siz
                    loop_bptt_mode=args.loop_bptt_mode,
                    disable_loop_x0_reinject=args.disable_loop_x0_reinject,
                    x0_conditioning=args.x0_conditioning,
-                   x0_conditioning_granularity=args.x0_conditioning_granularity)
+                   x0_conditioning_granularity=args.x0_conditioning_granularity,
+                   residual_layout=args.residual_layout)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -2022,6 +2041,7 @@ if master_process:
         "disable_loop_x0_reinject": args.disable_loop_x0_reinject,
         "x0_conditioning": args.x0_conditioning,
         "x0_conditioning_granularity": args.x0_conditioning_granularity,
+        "residual_layout": args.residual_layout,
         "final_loop_repeat_count": final_loop_repeat_count,
         "effective_train_tokens": step * TOTAL_BATCH_SIZE,
         "steps": step,
