@@ -18,7 +18,7 @@ import sys
 import shutil
 from types import SimpleNamespace
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import nullcontext
 
 import torch
@@ -523,6 +523,18 @@ parser.add_argument("--residual-layout",
                     choices=("sequential", "parallel", "parallel_nonloop_sequential_loop"),
                     default="sequential",
                     help="Residual layout inside transformer blocks.")
+parser.add_argument("--variable-width-profile", choices=("off", "x"), default="off",
+                    help="Use an internal variable-width transformer profile.")
+parser.add_argument("--vw-base-width", type=int, default=1024,
+                    help="Embedding/head width for variable-width runs.")
+parser.add_argument("--vw-max-width", type=int, default=1280,
+                    help="Fixed residual width and endpoint layer width for variable-width runs.")
+parser.add_argument("--vw-bottleneck-width", type=int, default=768,
+                    help="Minimum layer width at --vw-bottleneck-layer.")
+parser.add_argument("--vw-bottleneck-layer", type=int, default=18,
+                    help="One-indexed layer position of the X-profile bottleneck.")
+parser.add_argument("--vw-residual-mode", choices=("carry_forward",), default="carry_forward",
+                    help="How inactive residual dimensions move through narrower layers.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -538,6 +550,24 @@ DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
+if args.variable_width_profile != "off":
+    if N_EMBD != args.vw_base_width:
+        raise ValueError("--n_embd must match --vw-base-width for variable-width runs")
+    if args.vw_max_width < args.vw_base_width:
+        raise ValueError("--vw-max-width must be >= --vw-base-width")
+    if args.vw_bottleneck_width <= 0 or args.vw_bottleneck_width > args.vw_max_width:
+        raise ValueError("--vw-bottleneck-width must be in (0, --vw-max-width]")
+    if not 1 <= args.vw_bottleneck_layer <= DEPTH:
+        raise ValueError("--vw-bottleneck-layer must be one-indexed within the model depth")
+    for name, width in (
+        ("--vw-base-width", args.vw_base_width),
+        ("--vw-max-width", args.vw_max_width),
+        ("--vw-bottleneck-width", args.vw_bottleneck_width),
+    ):
+        if width % N_HEAD != 0:
+            raise ValueError(f"{name} must be divisible by --n_head")
+    if args.x0_conditioning != "none":
+        raise ValueError("variable-width mode currently requires --x0-conditioning none")
 if args.loop_repeat_count < 1:
     raise ValueError("--loop-repeat-count must be >= 1")
 if not 0.0 <= args.loop_transition_ratio <= 1.0:
@@ -547,8 +577,8 @@ if args.loop_mode != "none":
         raise ValueError("--loop-end must be >= --loop-start when --loop-mode is active")
     if args.loop_start < 0 or args.loop_end >= DEPTH:
         raise ValueError(f"--loop-start/--loop-end must be within [0, {DEPTH - 1}]")
-    if args.loop_mode == "unet_decoder" and args.loop_start < DEPTH // 2:
-        raise ValueError("--loop-mode unet_decoder requires --loop-start in the decoder half")
+    if args.loop_mode == "unet_decoder" and args.loop_end < DEPTH // 2:
+        raise ValueError("--loop-mode unet_decoder requires the loop range to reach the decoder half")
 if args.x0_conditioning != "none" and args.loop_mode != "unet_decoder":
     raise ValueError("--x0-conditioning modes are currently restricted to --loop-mode unet_decoder")
 if args.residual_layout == "parallel_nonloop_sequential_loop" and args.loop_mode == "none":
@@ -706,6 +736,14 @@ class GPTConfig:
     x0_conditioning: str = "none"
     x0_conditioning_granularity: str = "d_model"
     residual_layout: str = "sequential"
+    variable_width_profile: str = "off"
+    layer_widths: tuple = ()
+    residual_width: int = N_EMBD
+    vw_base_width: int = N_EMBD
+    vw_max_width: int = N_EMBD
+    vw_bottleneck_width: int = N_EMBD
+    vw_bottleneck_layer: int = 1
+    vw_residual_mode: str = "carry_forward"
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -713,6 +751,38 @@ def norm(x):
 def has_ve(layer_idx, n_layer):
     """Value Embedding on alternating layers, last layer always included."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+def build_variable_widths(profile, n_layer, base_width, max_width, bottleneck_width, bottleneck_layer, n_head):
+    if profile == "off":
+        return tuple([base_width] * n_layer)
+    if profile != "x":
+        raise ValueError(f"unknown variable-width profile: {profile}")
+    bottleneck_idx = bottleneck_layer - 1
+    if n_layer == 1:
+        widths = [max_width]
+    else:
+        ratio = max_width / bottleneck_width
+        widths = []
+        for layer_idx in range(n_layer):
+            if layer_idx <= bottleneck_idx:
+                denom = max(bottleneck_idx, 1)
+                exponent = (bottleneck_idx - layer_idx) / denom
+            else:
+                denom = max(n_layer - 1 - bottleneck_idx, 1)
+                exponent = (layer_idx - bottleneck_idx) / denom
+            widths.append(bottleneck_width * (ratio ** exponent))
+    quant = max(32, n_head)
+    rounded = []
+    for width in widths:
+        rounded_width = int(round(width / quant) * quant)
+        rounded_width = max(n_head, min(max_width, rounded_width))
+        if rounded_width % n_head != 0:
+            rounded_width = int(round(rounded_width / n_head) * n_head)
+        rounded.append(rounded_width)
+    rounded[0] = max_width
+    rounded[-1] = max_width
+    rounded[bottleneck_idx] = bottleneck_width
+    return tuple(rounded)
 
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
@@ -841,20 +911,33 @@ class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
         self.config = config
+        self.layer_widths = tuple(config.layer_widths) if config.layer_widths else tuple([config.n_embd] * config.n_layer)
+        self.residual_width = config.residual_width
+        self.variable_width_enabled = config.variable_width_profile != "off"
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([
+                Block(replace(config, n_embd=self.layer_widths[i]), i)
+                for i in range(config.n_layer)
+            ]),
         })
         self.lm_head = CastedLinearT(config.n_embd, padded_vocab)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        max_head_dim = self.residual_width // config.n_head
+        self.ve_projs = nn.ModuleDict({
+            str(i): nn.Linear(
+                self.layer_widths[i],
+                config.n_kv_head * (self.layer_widths[i] // config.n_head),
+                bias=False,
+            )
+            for i in range(config.n_layer)
+            if has_ve(i, config.n_layer)
+        })
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
@@ -880,7 +963,12 @@ class GPT(nn.Module):
                 for i in range(config.loop_start, config.loop_end + 1)
             })
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
+        self.rotary_head_dims = tuple(sorted({width // config.n_head for width in self.layer_widths}))
+        for head_dim in self.rotary_head_dims:
+            cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
+            self.register_buffer(f"cos_hd_{head_dim}", cos, persistent=False)
+            self.register_buffer(f"sin_hd_{head_dim}", sin, persistent=False)
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, max_head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -888,8 +976,8 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        s = 3**0.5 * self.config.n_embd**-0.5
-        for block in self.transformer.h:
+        for layer_idx, block in enumerate(self.transformer.h):
+            s = 3**0.5 * self.layer_widths[layer_idx]**-0.5
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -909,18 +997,24 @@ class GPT(nn.Module):
         x0_mlp_modules.extend(self.x0_loop_mlps.values())
         x0_mlp_modules.extend(self.x0_sbg_mlps.values())
         for mlp in x0_mlp_modules:
+            s = 3**0.5 * self.config.n_embd**-0.5
             torch.nn.init.uniform_(mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(mlp.c_proj.weight)
-        for proj in self.ve_projs.values():
+        for layer_key, proj in self.ve_projs.items():
+            s = 3**0.5 * self.layer_widths[int(layer_key)]**-0.5
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
-        head_dim = self.config.n_embd // self.config.n_head
+        head_dim = self.residual_width // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+        for head_dim in self.rotary_head_dims:
+            cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
+            setattr(self, f"cos_hd_{head_dim}", cos)
+            setattr(self, f"sin_hd_{head_dim}", sin)
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -947,6 +1041,32 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def _to_residual_width(self, x):
+        if x.size(-1) == self.residual_width:
+            return x
+        if x.size(-1) > self.residual_width:
+            return x[..., :self.residual_width]
+        return F.pad(x, (0, self.residual_width - x.size(-1)))
+
+    def _active_slice(self, x, layer_idx):
+        return x[..., :self.layer_widths[layer_idx]]
+
+    def _merge_active_slice(self, x, active, layer_idx):
+        width = self.layer_widths[layer_idx]
+        if width == self.residual_width:
+            return active
+        return torch.cat((active, x[..., width:]), dim=-1)
+
+    def _layer_cos_sin(self, layer_idx, seq_len):
+        head_dim = self.layer_widths[layer_idx] // self.config.n_head
+        return (
+            getattr(self, f"cos_hd_{head_dim}")[:, :seq_len],
+            getattr(self, f"sin_hd_{head_dim}")[:, :seq_len],
+        )
+
+    def _head_state(self, x):
+        return x[..., :self.config.n_embd]
+
     def _xsa_enabled(self, layer_idx):
         if self.config.xsa_mode == "off":
             return False
@@ -970,9 +1090,12 @@ class GPT(nn.Module):
                           + self.x0_lambdas.numel()
                           + self.skip_weights.numel()
                           + self.xsa_alphas.numel())
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        t = self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        attn_flops = sum(
+            12 * self.layer_widths[i] * self._avg_causal_attended_keys(w[0], t)
+            for i, w in enumerate(self.window_sizes)
+        )
         matmul_params = nparams - nparams_exclude
         if self.config.loop_mode != "none" and loop_repeat_count > 1:
             start, end = self.config.loop_start, self.config.loop_end
@@ -982,7 +1105,7 @@ class GPT(nn.Module):
                 if str(i) in self.ve_projs:
                     segment_params += sum(p.numel() for p in self.ve_projs[str(i)].parameters())
             segment_attn_flops = sum(
-                12 * h * q * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
+                12 * self.layer_widths[i] * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
                 for i in range(start, end + 1)
             )
             extra_repeats = loop_repeat_count - 1
@@ -1086,20 +1209,33 @@ class GPT(nn.Module):
         if i >= self.encoder_layers and skip_connections:
             skip = skip_connections.pop()
             x = x + self.skip_weights[i - self.encoder_layers] * skip
+        active = self._active_slice(x, i)
+        x0_active = self._active_slice(x0, i)
         if disable_x0_reinject:
-            x = self.resid_lambdas[i] * x
+            active = self.resid_lambdas[i] * active
         else:
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            active = self.resid_lambdas[i] * active + self.x0_lambdas[i] * x0_active
+        x = self._merge_active_slice(x, active, i)
         if apply_x0_conditioning:
             x = self._apply_loop_x0_conditioning(i, x, x0, x0_global_cache=x0_global_cache)
-        ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+        active = self._active_slice(x, i)
+        x0_active = self._active_slice(x0, i)
+        ve = self.ve_projs[str(i)](x0_active) if str(i) in self.ve_projs else None
         xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
         x0_adaln = (
             self._get_loop_x0_adaln(i, x, x0)
             if apply_x0_conditioning and self.config.x0_conditioning == "loop_mlp_adaln_norm_external"
             else None
         )
-        x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha, x0_adaln=x0_adaln)
+        active = self.transformer.h[i](
+            active,
+            ve,
+            self._layer_cos_sin(i, active.size(1)),
+            self.window_sizes[i],
+            xsa_alpha=xsa_alpha,
+            x0_adaln=x0_adaln,
+        )
+        x = self._merge_active_slice(x, active, i)
         if i < self.encoder_layers:
             skip_connections.append(x)
         return x
@@ -1188,7 +1324,7 @@ class GPT(nn.Module):
     ):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = norm(self.transformer.wte(idx))
+        x = self._to_residual_width(norm(self.transformer.wte(idx)))
         x0 = x
         skip_connections = []
         i = 0
@@ -1210,7 +1346,7 @@ class GPT(nn.Module):
             else:
                 x = self._run_layer(i, x, x0, cos_sin, skip_connections)
                 i += 1
-        x = norm(x)
+        x = norm(self._head_state(x))
         if targets is not None:
             # MTP training path: single lm_head, shifted targets, fused fp8 softcapped CE.
             # Eval (mtp_weights=None / model.eval()) keeps the plain bf16 path below so
@@ -1645,6 +1781,13 @@ print0(
     f"x0_conditioning_granularity={args.x0_conditioning_granularity}"
 )
 print0(f"  residual_layout={args.residual_layout}")
+print0(
+    f"  variable_width_profile={args.variable_width_profile}, "
+    f"vw_base_width={args.vw_base_width}, vw_max_width={args.vw_max_width}, "
+    f"vw_bottleneck_width={args.vw_bottleneck_width}, "
+    f"vw_bottleneck_layer={args.vw_bottleneck_layer}, "
+    f"vw_residual_mode={args.vw_residual_mode}"
+)
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -1664,6 +1807,16 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
+layer_widths = build_variable_widths(
+    args.variable_width_profile,
+    DEPTH,
+    N_EMBD,
+    args.vw_max_width if args.variable_width_profile != "off" else N_EMBD,
+    args.vw_bottleneck_width if args.variable_width_profile != "off" else N_EMBD,
+    args.vw_bottleneck_layer if args.variable_width_profile != "off" else 1,
+    N_HEAD,
+)
+residual_width = max(layer_widths) if args.variable_width_profile != "off" else N_EMBD
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
                    xsa_mode=args.xsa_mode,
                    loop_mode=args.loop_mode,
@@ -1673,7 +1826,15 @@ config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_siz
                    disable_loop_x0_reinject=args.disable_loop_x0_reinject,
                    x0_conditioning=args.x0_conditioning,
                    x0_conditioning_granularity=args.x0_conditioning_granularity,
-                   residual_layout=args.residual_layout)
+                   residual_layout=args.residual_layout,
+                   variable_width_profile=args.variable_width_profile,
+                   layer_widths=layer_widths,
+                   residual_width=residual_width,
+                   vw_base_width=args.vw_base_width,
+                   vw_max_width=args.vw_max_width,
+                   vw_bottleneck_width=args.vw_bottleneck_width,
+                   vw_bottleneck_layer=args.vw_bottleneck_layer,
+                   vw_residual_mode=args.vw_residual_mode)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1687,6 +1848,9 @@ other_params = param_counts - transformer_params - ve_params - lm_head_params
 num_flops_per_token = model.estimate_flops()
 print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
 print0(f"FLOPs per token: {num_flops_per_token:e}")
+if args.variable_width_profile != "off":
+    print0(f"Variable-width residual width: {residual_width}")
+    print0(f"Variable-width layer widths: {list(layer_widths)}")
 
 # Compile
 orig_model = model
@@ -2042,6 +2206,14 @@ if master_process:
         "x0_conditioning": args.x0_conditioning,
         "x0_conditioning_granularity": args.x0_conditioning_granularity,
         "residual_layout": args.residual_layout,
+        "variable_width_profile": args.variable_width_profile,
+        "vw_base_width": args.vw_base_width,
+        "vw_max_width": args.vw_max_width,
+        "vw_bottleneck_width": args.vw_bottleneck_width,
+        "vw_bottleneck_layer": args.vw_bottleneck_layer,
+        "vw_residual_mode": args.vw_residual_mode,
+        "vw_residual_width": residual_width,
+        "vw_layer_widths": list(layer_widths),
         "final_loop_repeat_count": final_loop_repeat_count,
         "effective_train_tokens": step * TOTAL_BATCH_SIZE,
         "steps": step,
