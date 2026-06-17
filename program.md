@@ -46,6 +46,7 @@ Design constraints:
 - transformer blocks use per-layer active widths.
 - residual stream stays at max width with carry-forward inactive dimensions.
 - each layer width is divisible by `n_head * 8 = 64`, so every FA3 head dimension is a multiple of 8.
+- Dynamo recompile limits are raised because variable-width intentionally creates more Muon matrix shapes.
 - result JSON records `vw_layer_widths` and `vw_residual_width`.
 
 ## Experiment Matrix
@@ -71,7 +72,7 @@ uv run python -m py_compile tiny/train.py
 
 ```bash
 torchrun --standalone --nproc_per_node=8 tiny/train.py \
-  --run-name smoke_pr94_vw_x_r075_mid512_recur30_s42_v2 \
+  --run-name smoke_pr94_vw_x_r075_mid512_recur30_s42_v3 \
   --variable-width-profile x \
   --vw-base-width 1024 \
   --vw-max-width 1280 \
@@ -83,7 +84,7 @@ torchrun --standalone --nproc_per_node=8 tiny/train.py \
 
 ```bash
 torchrun --standalone --nproc_per_node=8 tiny/train.py \
-  --run-name smoke_pr94_vw_x_r0875_mid768_recur30_s42_v2 \
+  --run-name smoke_pr94_vw_x_r0875_mid768_recur30_s42_v3 \
   --variable-width-profile x \
   --vw-base-width 1024 \
   --vw-max-width 1280 \

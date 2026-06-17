@@ -34,6 +34,15 @@ import numpy as np
 
 import tiktoken
 
+try:
+    import torch._dynamo
+    if hasattr(torch._dynamo.config, "recompile_limit"):
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+    if hasattr(torch._dynamo.config, "cache_size_limit"):
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+except Exception:
+    pass
+
 # Bind this rank to its GPU *before* importing cuda_kernels: that module compiles the
 # fused CE CUDA kernel at import time, and torch.cuda._compile_kernel binds the
 # resulting function to whatever CUDA context is current. Without this, every rank
