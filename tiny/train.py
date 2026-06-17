@@ -450,7 +450,7 @@ def build_variable_widths(profile, n_layer, base_width, max_width, bottleneck_wi
     if not 0 <= bottleneck_idx < n_layer:
         raise ValueError("bottleneck_layer must be 1-indexed within model depth")
 
-    multiple = max(32, n_head)
+    multiple = math.lcm(32, n_head * 8)
 
     def round_width(value):
         rounded = int(round(value / multiple) * multiple)
