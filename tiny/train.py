@@ -135,8 +135,8 @@ parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
 parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
                     help="Fraction of training over which the extra MTP heads decay to zero weight.")
-parser.add_argument("--variable-width-profile", choices=("off", "x"), default="off",
-                    help="Layer-width profile. 'x' widens early/final layers and narrows the middle.")
+parser.add_argument("--variable-width-profile", choices=("off", "x", "prefix_wide"), default="off",
+                    help="Layer-width profile. 'x' widens early/final layers and narrows the middle; 'prefix_wide' widens only the first N blocks internally.")
 parser.add_argument("--vw-base-width", type=int, default=1024,
                     help="Embedding and lm_head width for variable-width mode.")
 parser.add_argument("--vw-max-width", type=int, default=1280,
@@ -145,7 +145,9 @@ parser.add_argument("--vw-bottleneck-width", type=int, default=768,
                     help="Narrowest active layer width for variable-width mode.")
 parser.add_argument("--vw-bottleneck-layer", type=int, default=12,
                     help="1-indexed bottleneck layer for variable-width mode.")
-parser.add_argument("--vw-residual-mode", choices=("carry_forward",), default="carry_forward",
+parser.add_argument("--vw-prefix-layers", type=int, default=2,
+                    help="Number of initial blocks widened for prefix_wide.")
+parser.add_argument("--vw-residual-mode", choices=("carry_forward", "project_back"), default="carry_forward",
                     help="Residual handling for inactive width dimensions.")
 args = parser.parse_args()
 
@@ -182,6 +184,10 @@ if args.variable_width_profile != "off":
         raise ValueError("--vw-bottleneck-width must be in (0, --vw-max-width]")
     if not 1 <= args.vw_bottleneck_layer <= DEPTH:
         raise ValueError("--vw-bottleneck-layer must be within model depth")
+    if not 0 <= args.vw_prefix_layers <= DEPTH:
+        raise ValueError("--vw-prefix-layers must be within model depth")
+    if args.variable_width_profile == "prefix_wide" and args.vw_residual_mode != "project_back":
+        raise ValueError("prefix_wide requires --vw-residual-mode project_back")
     for label, width in (
         ("--vw-base-width", args.vw_base_width),
         ("--vw-max-width", args.vw_max_width),
@@ -437,6 +443,7 @@ class GPTConfig:
     vw_max_width: int = N_EMBD
     vw_bottleneck_width: int = N_EMBD
     vw_bottleneck_layer: int = 1
+    vw_prefix_layers: int = 0
     vw_residual_mode: str = "carry_forward"
 
 def norm(x):
@@ -447,9 +454,11 @@ def has_ve(layer_idx, n_layer):
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
-def build_variable_widths(profile, n_layer, base_width, max_width, bottleneck_width, bottleneck_layer, n_head):
+def build_variable_widths(profile, n_layer, base_width, max_width, bottleneck_width, bottleneck_layer, n_head, prefix_layers=0):
     if profile == "off":
         return tuple([base_width] * n_layer)
+    if profile == "prefix_wide":
+        return tuple(max_width if i < prefix_layers else base_width for i in range(n_layer))
     if profile != "x":
         raise ValueError(f"unknown variable-width profile: {profile}")
 
@@ -589,6 +598,7 @@ class GPT(nn.Module):
         self.layer_widths = tuple(config.layer_widths) if config.layer_widths else tuple([config.n_embd] * config.n_layer)
         self.residual_width = config.residual_width
         self.variable_width_enabled = config.variable_width_profile != "off"
+        self.project_back_enabled = config.vw_residual_mode == "project_back"
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
@@ -599,6 +609,16 @@ class GPT(nn.Module):
                 Block(replace(config, n_embd=self.layer_widths[i]), i)
                 for i in range(config.n_layer)
             ]),
+        })
+        self.layer_in_projs = nn.ModuleDict({
+            str(i): nn.Linear(self.residual_width, self.layer_widths[i], bias=False)
+            for i in range(config.n_layer)
+            if self.layer_widths[i] > self.residual_width
+        })
+        self.layer_out_projs = nn.ModuleDict({
+            str(i): nn.Linear(self.layer_widths[i], self.residual_width, bias=False)
+            for i in range(config.n_layer)
+            if self.layer_widths[i] > self.residual_width
         })
         self.lm_head = CastedLinearT(config.n_embd, padded_vocab)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -642,6 +662,14 @@ class GPT(nn.Module):
         for layer_key, proj in self.ve_projs.items():
             s = 3**0.5 * self.layer_widths[int(layer_key)]**-0.5
             torch.nn.init.uniform_(proj.weight, -s, s)
+        for layer_key, proj in self.layer_in_projs.items():
+            proj.weight.zero_()
+            width = min(proj.weight.size(0), proj.weight.size(1))
+            proj.weight[:width, :width].copy_(torch.eye(width, device=proj.weight.device, dtype=proj.weight.dtype))
+        for layer_key, proj in self.layer_out_projs.items():
+            proj.weight.zero_()
+            width = min(proj.weight.size(0), proj.weight.size(1))
+            proj.weight[:width, :width].copy_(torch.eye(width, device=proj.weight.device, dtype=proj.weight.dtype))
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
@@ -703,13 +731,21 @@ class GPT(nn.Module):
         return x[..., :self.config.n_embd]
 
     def _active_slice(self, x, layer_idx):
-        return x[..., :self.layer_widths[layer_idx]]
+        return x[..., :min(self.layer_widths[layer_idx], self.residual_width)]
 
     def _merge_active_slice(self, x, active, layer_idx):
-        width = self.layer_widths[layer_idx]
+        width = min(self.layer_widths[layer_idx], self.residual_width)
         if width == self.residual_width:
             return active
         return torch.cat((active, x[..., width:]), dim=-1)
+
+    def _project_to_layer_width(self, active, layer_idx):
+        layer_key = str(layer_idx)
+        return self.layer_in_projs[layer_key](active) if layer_key in self.layer_in_projs else active
+
+    def _project_to_residual_width(self, active, layer_idx):
+        layer_key = str(layer_idx)
+        return self.layer_out_projs[layer_key](active) if layer_key in self.layer_out_projs else active
 
     def _layer_cos_sin(self, layer_idx, seq_len):
         head_dim = self.layer_widths[layer_idx] // self.config.n_head
@@ -731,6 +767,8 @@ class GPT(nn.Module):
         shared_recurrent_params = (
             sum(p.numel() for p in self.transformer.h.parameters())
             + sum(p.numel() for p in self.ve_projs.parameters())
+            + sum(p.numel() for p in self.layer_in_projs.parameters())
+            + sum(p.numel() for p in self.layer_out_projs.parameters())
         )
         # Exclude non-matmul params: embedding lookup + elementwise scalars
         nparams_exclude = (self.transformer.wte.weight.numel()
@@ -758,7 +796,12 @@ class GPT(nn.Module):
         # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
         attn_gate_ids = {id(p) for p in attn_gate_params}
-        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        all_h_params = (
+            list(self.transformer.h.parameters())
+            + list(self.ve_projs.parameters())
+            + list(self.layer_in_projs.parameters())
+            + list(self.layer_out_projs.parameters())
+        )
         matrix_params = [
             p
             for p in all_h_params
@@ -804,8 +847,8 @@ class GPT(nn.Module):
             active = self.resid_lambdas[i] * active + self.x0_lambdas[i] * x0_active
             x = self._merge_active_slice(x, active, i)
 
-            active = self._active_slice(x, i)
-            x0_active = self._active_slice(x0, i)
+            active = self._project_to_layer_width(self._active_slice(x, i), i)
+            x0_active = self._project_to_layer_width(self._active_slice(x0, i), i)
             ve = self.ve_projs[str(i)](x0_active) if str(i) in self.ve_projs else None
             xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
             active = block(
@@ -815,6 +858,7 @@ class GPT(nn.Module):
                 self.window_sizes[i],
                 xsa_alpha=xsa_alpha,
             )
+            active = self._project_to_residual_width(active, i)
             x = self._merge_active_slice(x, active, i)
             if i < self.encoder_layers:
                 skip_connections.append(x)
@@ -1344,6 +1388,7 @@ print0(
     f"vw_base_width={args.vw_base_width}, vw_max_width={args.vw_max_width}, "
     f"vw_bottleneck_width={args.vw_bottleneck_width}, "
     f"vw_bottleneck_layer={args.vw_bottleneck_layer}, "
+    f"vw_prefix_layers={args.vw_prefix_layers}, "
     f"vw_residual_mode={args.vw_residual_mode}"
 )
 print0(f"  run={run_name}")
@@ -1373,8 +1418,9 @@ layer_widths = build_variable_widths(
     args.vw_bottleneck_width if args.variable_width_profile != "off" else N_EMBD,
     args.vw_bottleneck_layer if args.variable_width_profile != "off" else 1,
     N_HEAD,
+    args.vw_prefix_layers if args.variable_width_profile != "off" else 0,
 )
-residual_width = max(layer_widths) if args.variable_width_profile != "off" else N_EMBD
+residual_width = N_EMBD if args.vw_residual_mode == "project_back" else max(layer_widths)
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
                    xsa_mode=args.xsa_mode, num_iterations=NUM_ITERATIONS,
                    variable_width_profile=args.variable_width_profile,
@@ -1384,6 +1430,7 @@ config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_siz
                    vw_max_width=args.vw_max_width,
                    vw_bottleneck_width=args.vw_bottleneck_width,
                    vw_bottleneck_layer=args.vw_bottleneck_layer,
+                   vw_prefix_layers=args.vw_prefix_layers,
                    vw_residual_mode=args.vw_residual_mode)
 with torch.device("meta"):
     model = GPT(config)
@@ -1797,6 +1844,7 @@ if master_process:
         "vw_max_width": args.vw_max_width,
         "vw_bottleneck_width": args.vw_bottleneck_width,
         "vw_bottleneck_layer": args.vw_bottleneck_layer,
+        "vw_prefix_layers": args.vw_prefix_layers,
         "vw_residual_mode": args.vw_residual_mode,
         "vw_residual_width": residual_width,
         "vw_layer_widths": list(layer_widths),
