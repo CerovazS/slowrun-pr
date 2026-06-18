@@ -204,6 +204,11 @@ Hypothesis:
 - Compute should stay close to the PR94 baseline, plausibly within the unused roughly one-minute wall-time margin.
 - A win requires best/checkpoint-avg val loss `< 3.307` while staying near or below `15.00m` training time.
 
+Outcome:
+
+- `pr94_prefix_wide_l02_1280_recur30_s42_fa3_cached` completed with `best_val_loss=3.320786`, `train_time=15.15m`, `wall_time=17.49m`.
+- This is a `reject_quality` and borderline `reject_time`: widening two full blocks internally to `1280` was materially more expensive than expected (`337.7M` parameters) and did not recover enough quality.
+
 ## Checklist
 
 - [x] Create branch from current `origin/main`.
@@ -215,6 +220,6 @@ Hypothesis:
 - [x] Build summary JSON/report from `runs/*/result.json`.
 - [x] Interpret results relative to the current 2x recurrence and fp8 MTP record.
 - [x] Implement dedicated `prefix_wide` profile with base/residual stream fixed at `1024`.
-- [ ] Smoke test `pr94_prefix_wide_l02_1280_recur30_s42`.
-- [ ] Run full `pr94_prefix_wide_l02_1280_recur30_s42` and compare against PR94 record.
+- [x] Smoke test `pr94_prefix_wide_l02_1280_recur30_s42`.
+- [x] Run full `pr94_prefix_wide_l02_1280_recur30_s42_fa3_cached` and compare against PR94 record: `reject_quality`, borderline `reject_time`.
 - [ ] Run diagnostic `pr94_vw_x_r075_mid512_recur30_s42_e16` only if still useful after `prefix_wide`.
